@@ -60,7 +60,11 @@ VOICE_FILES = {
 winmm = ctypes.windll.winmm
 _audio_lock = threading.Lock()
 
-last_wrong_sound_time = 0.0
+last_wrong_sound_time = None
+last_wrong_digit = None
+paper_was_away = True
+paper_last_seen_time = 0.0
+wrong_count = 0
 recent_audio_played = "待命"
 
 def play_voice(sound_key: str, text_desc: str):
@@ -113,18 +117,31 @@ def play_voice(sound_key: str, text_desc: str):
     threading.Thread(target=_speak_worker, daemon=True).start()
 
 def play_wrong_number_sound(mode_name, detected_digit):
-    """当识别到错误/非目标数字时，播报警告语音提示重试（带2.5秒防抖防重复，持续识别不限时）"""
-    global last_wrong_sound_time
+    """
+    当拿出错误/非目标数字时严格仅播报 1 次语音，出示期间绝不反复重复！
+    只有在卡片完全移出视野并重新举起、或更换其他数字时才会在出示时播报一次。
+    """
+    global last_wrong_sound_time, last_wrong_digit, paper_was_away, wrong_count
     now = time.time()
-    if now - last_wrong_sound_time < 2.5:
+
+    # 核心：只要卡片还在视野中且数字相同，严格只播报 1 次，绝对杜绝反复重复报错
+    if not paper_was_away and detected_digit == last_wrong_digit:
         return
+
+    # 防重叠防抖：两次播报之间必须间隔 2.5 秒以上
+    if last_wrong_sound_time is not None and (now - last_wrong_sound_time < 2.5):
+        return
+
     last_wrong_sound_time = now
+    last_wrong_digit = detected_digit
+    paper_was_away = False
+    wrong_count += 1
 
     if mode_name == MODE_FAN:
-        add_log(f"【出示非目标】识别出数字 '{detected_digit}' (目标: '2') -> 播报: 识别不到数字2，请重试")
+        add_log(f"【出示非目标】识别出数字 '{detected_digit}' (目标: '2') -> 播报(仅1次): 识别不到数字2，请重试")
         play_voice('fan_wrong', "识别不到数字2，请重试")
     elif mode_name == MODE_LED:
-        add_log(f"【出示非目标】识别出数字 '{detected_digit}' (目标: '4') -> 播报: 识别不到数字4，请重试")
+        add_log(f"【出示非目标】识别出数字 '{detected_digit}' (目标: '4') -> 播报(仅1次): 识别不到数字4，请重试")
         play_voice('led_wrong', "识别不到数字4，请重试")
 
 def play_no_sound():
@@ -520,13 +537,16 @@ class SmartVisionDetector:
 
     def _evaluate_digit_inside_roi(self, roi_gray):
         rh, rw = roi_gray.shape[:2]
-        if rw < 35 or rh < 35:
+        if rw < 18 or rh < 18:
             return None
             
-        blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+        # 根据 ROI 尺寸自适应平滑与形态学核 (远距离150cm保持数字4内部三角环孔不粘连，近距离平滑墨迹)
+        blur_k = (3, 3) if min(rw, rh) < 60 else (5, 5)
+        blurred = cv2.GaussianBlur(roi_gray, blur_k, 0)
         otsu_val, digit_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
-        k_digit = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        morph_k = (3, 3) if min(rw, rh) < 80 else (5, 5)
+        k_digit = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, morph_k)
         digit_closed = cv2.morphologyEx(digit_mask, cv2.MORPH_CLOSE, k_digit)
         d_conts, hierarchy = cv2.findContours(digit_closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if not d_conts or hierarchy is None or len(self.labels) == 0:
@@ -537,15 +557,16 @@ class SmartVisionDetector:
             if hierarchy[0][i][3] != -1:  # 必须是外层轮廓
                 continue
             da = cv2.contourArea(dc)
-            if da < (rw * rh * 0.015) or da > (rw * rh * 0.60):
+            # 兼容 10cm-150cm 极大尺度范围 (远距150cm数字面积较小，近距10cm数字面积较大)
+            if da < max(10.0, rw * rh * 0.002) or da > (rw * rh * 0.85):
                 continue
             dx, dy, dw, dh = cv2.boundingRect(dc)
-            # 严格内缩边距：数字绝不能贴着纸张边缘 (过滤手指、纸边阴影、环境杂色)
+            # 内缩边距自适应 (过滤完全贴在纸边的手部/杂物)
             margin_x = min(dx, rw - (dx + dw))
             margin_y = min(dy, rh - (dy + dh))
-            if margin_x < rw * 0.03 or margin_y < rh * 0.03:
+            if margin_x < max(2, rw * 0.01) or margin_y < max(2, rh * 0.01):
                 continue
-            if dw < rw * 0.10 or dh < rh * 0.12:
+            if dw < max(5, rw * 0.03) or dh < max(6, rh * 0.04):
                 continue
             digit_cands.append((da, i, dc, (dx, dy, dw, dh)))
             
@@ -555,19 +576,19 @@ class SmartVisionDetector:
         best_cand = max(digit_cands, key=lambda x: x[0])
         da, max_idx, best_c, (dx, dy, dw, dh) = best_cand
         
-        # 笔迹与白纸对比度检验 (防止纯白墙面微弱噪点误触发)
+        # 笔迹与白纸对比度检验 (严格要求背景为高亮A4白纸底色，墨迹对比清晰)
         c_mask = np.zeros_like(roi_gray, dtype=np.uint8)
         cv2.drawContours(c_mask, [best_c], -1, 255, -1)
         paper_bg_mean = np.mean(roi_gray[digit_mask == 0]) if np.any(digit_mask == 0) else 255.0
         ink_mean = np.mean(roi_gray[c_mask == 255]) if np.any(c_mask == 255) else 0.0
         contrast = paper_bg_mean - ink_mean
-        if contrast < 25:
+        if paper_bg_mean < 145 or contrast < 22:
             return None
             
         # 拓扑封闭空洞检查 (数字 4 必定包含内部闭合三角环孔，1/2/3 无闭合环)
         has_hole = False
         for i, h_info in enumerate(hierarchy[0]):
-            if h_info[3] == max_idx and cv2.contourArea(d_conts[i]) > (da * 0.015):
+            if h_info[3] == max_idx and cv2.contourArea(d_conts[i]) > (da * 0.010):
                 has_hole = True
                 break
                 
@@ -602,9 +623,10 @@ class SmartVisionDetector:
     def _detect_paper_and_digit(self, frame):
         """
         在 640x360 画面中秒级寻找 A4 白纸和其中的数字
-        严格准则：
-        1. 绝不识别人脸、皮肤、衣服或房间瓷砖背景；
-        2. 仅当在画面中锁定真实手持 A4 白纸且内部包含有效数字(>=70%)时才锁定并输出！
+        【硬性准则：必须且仅识别手持 A4 白纸内部的有效数字，其他背景、人脸、衣服绝对不识别】
+        1. 必须在视野中检测到真实手持 A4 白纸轮廓 (几何凸矩形、低饱和纯白底色、尺寸符合 10cm-150cm 纵深)；
+        2. 绝不使用全屏兜底，绝不把背景墙或衣服当白纸；
+        3. 仅当在锁定的 A4 白纸有效边界内部检测出符合目标特征的数字(>=70%)时才锁定输出！
         """
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -612,10 +634,10 @@ class SmartVisionDetector:
         sat = hsv[:, :, 1]
         val = hsv[:, :, 2]
         
-        # 多级亮度阈值自适应 (从高亮度纯白纸张到普通白纸，彻底排除暗沉墙面瓷砖)
-        for v_thresh in [175, 160, 145]:
-            white_mask = ((val > v_thresh) & (sat < 65)).astype(np.uint8) * 255
-            k_paper = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        # 多级亮度阈值自适应 (严格检测高亮、低饱和的纯白纸张)
+        for v_thresh in [170, 155, 140]:
+            white_mask = ((val > v_thresh) & (sat < 60)).astype(np.uint8) * 255
+            k_paper = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
             white_closed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, k_paper)
             conts, _ = cv2.findContours(white_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if not conts:
@@ -625,26 +647,34 @@ class SmartVisionDetector:
             conts = sorted(conts, key=cv2.contourArea, reverse=True)
             for c in conts:
                 area = cv2.contourArea(c)
-                # 排除过小与铺满全屏的对象
-                if area < (w * h * 0.04) or area > (w * h * 0.85):
+                # 覆盖 10cm~150cm：最小面积 0.8% (远距150cm)，最大允许 88% (近距10-20cm大图，绝不包揽全屏背景)
+                if area < (w * h * 0.008) or area > (w * h * 0.88):
                     continue
                     
                 bx, by, bw, bh = cv2.boundingRect(c)
                 
-                # 排除紧贴画面 >= 2 个外边缘的物体 (墙壁、天花板、地面连片瓷砖)
+                # 触边检验：绝不能贴靠 >= 3 条边 (贴靠3-4边必定是背景墙、天花板或地面)
                 touches = sum([bx <= 2, by <= 2, (bx + bw) >= (w - 2), (by + bh) >= (h - 2)])
-                if touches >= 2:
+                if touches >= 3:
+                    continue
+                if touches == 2 and area < (w * h * 0.20):
                     continue
                     
-                # 宽高比必须符合手持纸张常见比例 (0.40 ~ 2.40)
+                # 严格 A4 纸长宽比 (标准手持与倾斜允许范围: 0.40 ~ 2.40)
                 aspect = float(bw) / bh
                 if aspect < 0.40 or aspect > 2.40:
                     continue
                     
-                # 凸包实心度 (A4 白纸为凸多边形矩形，背景墙凹凸不平实心度低)
+                # 严格 A4 白纸凸实心度 (矩形白纸实心度高，衣服/人脸/环境杂乱背景实心度低)
                 hull = cv2.convexHull(c)
                 solidity = area / max(1.0, cv2.contourArea(hull))
                 if solidity < 0.68:
+                    continue
+                    
+                # 白纸区域颜色纯净度校验 (确认是真正的白纸，排除人脸、肤色与有色衣物)
+                roi_val = val[by:by+bh, bx:bx+bw]
+                roi_sat = sat[by:by+bh, bx:bx+bw]
+                if np.mean(roi_val) < 150 or np.mean(roi_sat) > 55:
                     continue
                     
                 # 提取白纸 ROI，检验内部是否真正存在符合比赛要求的高对比度数字
@@ -661,7 +691,7 @@ class SmartVisionDetector:
                         [digit_box[0], digit_box[1] + digit_box[3]]
                     ]
                     return paper_box, (digit_pred, da, conf, pts, digit_pred)
-                    
+
         return None, None
 
     def _extract_digits(self, ocr_res, sx, sy, offset_x=0, offset_y=0):
@@ -731,16 +761,22 @@ def start_fan_test():
     """启动风扇测试模式 (目标: 2, 持续识别不限时)"""
     global test_mode, test_state, test_start_time, target_digit
     global action_end_time, active_action_device, cancel_reason
+    global last_wrong_sound_time, last_wrong_digit, paper_was_away, paper_last_seen_time, wrong_count
     set_all_off()
     ocr_detector.reset()
     action_end_time = 0.0
     active_action_device = None
     cancel_reason = None
+    last_wrong_sound_time = None
+    last_wrong_digit = None
+    paper_was_away = True
+    paper_last_seen_time = 0.0
+    wrong_count = 0
     test_mode = MODE_FAN
     test_state = STATE_TESTING
     target_digit = '2'
     test_start_time = time.time()
-    add_log("【进入风扇测试】目标: 数字 '2'，持续识别中（不限时）...")
+    add_log("【进入风扇测试】目标: 数字 '2'，持续识别中（不限时，支持 10-150cm 距离）...")
     # 比赛标准语音播报: “请拿出数字进行识别”
     play_voice('fan_prompt', "请拿出数字进行识别")
 
@@ -748,28 +784,40 @@ def start_led_test():
     """启动指示灯测试模式 (目标: 4, 持续识别不限时)"""
     global test_mode, test_state, test_start_time, target_digit
     global action_end_time, active_action_device, cancel_reason
+    global last_wrong_sound_time, last_wrong_digit, paper_was_away, paper_last_seen_time, wrong_count
     set_all_off()
     ocr_detector.reset()
     action_end_time = 0.0
     active_action_device = None
     cancel_reason = None
+    last_wrong_sound_time = None
+    last_wrong_digit = None
+    paper_was_away = True
+    paper_last_seen_time = 0.0
+    wrong_count = 0
     test_mode = MODE_LED
     test_state = STATE_TESTING
     target_digit = '4'
     test_start_time = time.time()
-    add_log("【进入指示灯测试】目标: 数字 '4'，持续识别中（不限时）...")
+    add_log("【进入指示灯测试】目标: 数字 '4'，持续识别中（不限时，支持 10-150cm 距离）...")
     # 比赛标准语音播报: “请拿出数字进行识别”
     play_voice('led_prompt', "请拿出数字进行识别")
 
 def stop_all_programs():
     """所有程序停止按钮：强行中止所有测试并彻底切断所有继电器负载"""
     global test_mode, test_state, action_end_time, active_action_device, cancel_reason
+    global last_wrong_sound_time, last_wrong_digit, paper_was_away, paper_last_seen_time, wrong_count
     ocr_detector.reset()
     test_mode = MODE_IDLE
     test_state = STATE_TIMEOUT
     cancel_reason = None
     action_end_time = 0.0
     active_action_device = None
+    last_wrong_sound_time = None
+    last_wrong_digit = None
+    paper_was_away = True
+    paper_last_seen_time = 0.0
+    wrong_count = 0
     set_all_off()
     add_log("【全部停止】已强行中止所有测试程序，风扇与指示灯电源已完全关断复位！")
 
@@ -1195,6 +1243,11 @@ def build_dashboard_frame(preview_frame):
 def main():
     global test_mode, test_state, test_start_time, remaining_time
     global action_end_time, active_action_device, should_exit
+    global paper_last_seen_time, paper_was_away, last_wrong_digit
+
+    paper_last_seen_time = time.time()
+    paper_was_away = True
+    last_wrong_digit = None
 
     print("\n" + "="*68)
     print("      AI应用场景比赛 · 4K超高清A4纸数字识别与控制系统")
@@ -1225,6 +1278,7 @@ def main():
                 if test_state == STATE_TESTING:
                     latest_ocr, ocr_t, latest_paper = ocr_detector.get_latest_result()
                     if latest_paper and latest_ocr and (now - ocr_t < 0.8):
+                        paper_last_seen_time = now
                         digit, area, score, box, raw_text = latest_ocr
                         # 用户硬性指标：达到 70% 即算识别成功
                         if score >= 0.70:
@@ -1232,8 +1286,17 @@ def main():
                                 # 真实命中！触发7秒运转与“识别成功”语音
                                 trigger_action_success(test_mode, digit)
                             else:
-                                # 识别到错误/非目标数字：播报“识别不到数字X，请重试”
+                                # 识别到错误/非目标数字：拿出时仅播报一次，持卡期间绝不重复
                                 play_wrong_number_sound(test_mode, digit)
+                    elif latest_paper:
+                        # 视野中有白纸但正在分析中，刷新最近存在时间
+                        paper_last_seen_time = now
+                    else:
+                        # 只有当白纸真正完全离开视野超过 1.5 秒时，才标记卡片已拿走
+                        # 彻底防止手部微颤或算法刷新引起的偶发掉帧导致重复报错！
+                        if now - paper_last_seen_time >= 1.5:
+                            paper_was_away = True
+                            last_wrong_digit = None
 
             # ---------------- 7秒硬件动作持续时间与停止语音 ----------------
             if action_end_time > 0:
